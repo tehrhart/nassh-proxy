@@ -1,0 +1,19 @@
+services:
+  ssh-relay:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: ssh-relay:local
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:8080:8080"
+    # Mount a log directory when using the file sink.
+    # volumes:
+    #   - /var/log/ssh-relay:/var/log/ssh-relay
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz',timeout=2).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

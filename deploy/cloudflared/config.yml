@@ -1,0 +1,18 @@
+# /etc/cloudflared/config.yml
+#
+# Named tunnel for the ssh-relay. Route DNS with:
+#   cloudflared tunnel route dns ssh-relay ssh-relay.example.com
+
+tunnel: ssh-relay
+credentials-file: /etc/cloudflared/ssh-relay.json
+
+ingress:
+  - hostname: ssh-relay.example.com
+    service: http://127.0.0.1:8080
+    originRequest:
+      noTLSVerify: true
+      connectTimeout: 10s
+      # WebSocket upgrades are forwarded automatically.
+      # For long-lived SSH sessions, raise CF edge idle timeouts in the dashboard
+      # (Network → "WebSockets" and the Access Application session duration).
+  - service: http_status:404
