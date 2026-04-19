@@ -52,3 +52,9 @@ def test_none_provider_with_no_credentials_ok():
     s = _settings()
     provider = _build_identity(s)
     assert provider.name == "none"
+
+
+def test_none_provider_with_auth_required_raises():
+    s = _settings(auth_required=True)
+    with pytest.raises(RuntimeError, match="contradictory"):
+        _build_identity(s)

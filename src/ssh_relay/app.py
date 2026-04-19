@@ -257,6 +257,17 @@ async def _run_session(ws: WebSocket, session: Session, sessions: dict, resume_f
 def _build_identity(s: Settings) -> IdentityProvider:
     kind = s.identity_provider.lower()
 
+    # The NoneProvider does not authenticate anything; pairing it with
+    # auth_required=True is a configuration contradiction that would otherwise
+    # silently start an unauthenticated service.
+    if kind in ("none", "disabled", "") and s.auth_required:
+        raise RuntimeError(
+            "RELAY_IDENTITY_PROVIDER=none with RELAY_AUTH_REQUIRED=true is "
+            "contradictory — the 'none' provider never authenticates. "
+            "Either pick a real provider (cloudflare-access, gcp-iap) or set "
+            "RELAY_AUTH_REQUIRED=false explicitly to acknowledge."
+        )
+
     # Fail loudly when provider-specific credentials are set but the provider
     # isn't selected. A silent fall-through to the 'none' provider means every
     # request is unauthenticated — the opposite of what the operator intended.
