@@ -16,7 +16,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from .events import EventBus, Sink, new_event_id, now
 from .identity import Identity, IdentityProvider, build_provider
 from .net import open_tcp
-from .ports import NoPool, PortPool
+from .ports import NoPool, PortPool, PortPoolExhausted
 from .session import Session, SessionGone, SessionLimits
 from .sinks import PanUserIdSink, RotatingFileSink, SplunkHECSink, StderrSink
 from .target_policy import TargetDenied, TargetPolicy
@@ -42,6 +42,8 @@ class Settings(BaseSettings):
     max_frame_bytes: int = 1 * 1024 * 1024
     max_replay_buffer: int = 4 * 1024 * 1024
     grace_seconds: int = 120
+    max_sessions_total: int = 1000
+    max_sessions_per_identity: int = 100
 
     # WebSocket Origin allowlist for /v4/connect and /v4/reconnect.
     # nassh opens the WebSocket from its own chrome-extension:// page, so the
@@ -172,6 +174,25 @@ async def v4_connect(
     bus: EventBus = ws.app.state.bus
     settings: Settings = ws.app.state.settings
     policy: TargetPolicy = ws.app.state.target_policy
+    sessions: dict[str, Session] = ws.app.state.sessions
+
+    identity_key = identity.principal if isinstance(identity, Identity) else None
+    cap_reason = _session_cap_reason(settings, sessions, identity_key)
+    if cap_reason is not None:
+        bus.emit({
+            "event": "session_capped",
+            "event_id": new_event_id(),
+            "ts": now()[0],
+            "identity": _identity_dict(identity),
+            "source_ip": _source_ip(ws),
+            "target_host": host,
+            "target_port": port,
+            "reason": cap_reason,
+        })
+        log.warning("session capped (%s) for identity=%s", cap_reason, identity_key)
+        await ws.accept(subprotocol="ssh")
+        await ws.close(code=4429)
+        return
 
     try:
         target = await policy.resolve_and_check(host, port)
@@ -191,7 +212,23 @@ async def v4_connect(
         await ws.close(code=4403)
         return
 
-    source_port = await port_pool.acquire()
+    try:
+        source_port = await port_pool.acquire()
+    except PortPoolExhausted:
+        bus.emit({
+            "event": "port_pool_exhausted",
+            "event_id": new_event_id(),
+            "ts": now()[0],
+            "identity": _identity_dict(identity),
+            "source_ip": _source_ip(ws),
+            "target_host": host,
+            "target_port": port,
+        })
+        log.warning("port pool exhausted; rejecting %s:%s", host, port)
+        await ws.accept(subprotocol="ssh")
+        await ws.close(code=4503)
+        return
+
     dial_started = time.monotonic()
     try:
         # Connect to the resolved IP, not the hostname, to avoid a second DNS
@@ -208,7 +245,6 @@ async def v4_connect(
 
     await ws.accept(subprotocol="ssh")
     sid = uuid.uuid4().hex
-    identity_key = identity.principal if isinstance(identity, Identity) else None
 
     meta = _build_meta(
         ws=ws,
@@ -233,7 +269,6 @@ async def v4_connect(
         emit=bus.emit,
         on_close=_release_port,
     )
-    sessions: dict[str, Session] = ws.app.state.sessions
     sessions[sid] = session
     session.emit_start()
 
@@ -339,6 +374,18 @@ def _build_port_pool(s: Settings) -> PortPool | NoPool:
     if s.source_port_min is None or s.source_port_max is None:
         return NoPool()
     return PortPool(s.source_port_min, s.source_port_max)
+
+
+def _session_cap_reason(
+    s: Settings, sessions: dict, identity_key: str | None
+) -> str | None:
+    if len(sessions) >= s.max_sessions_total:
+        return "global_session_cap"
+    if identity_key is not None:
+        mine = sum(1 for sess in sessions.values() if sess.identity_key == identity_key)
+        if mine >= s.max_sessions_per_identity:
+            return "per_identity_session_cap"
+    return None
 
 
 def _build_target_policy(s: Settings) -> TargetPolicy:
