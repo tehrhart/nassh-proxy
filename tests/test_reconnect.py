@@ -17,6 +17,8 @@ os.environ.setdefault("RELAY_AUTH_REQUIRED", "false")
 os.environ.setdefault("RELAY_LOG_SINKS", "stderr")
 os.environ.setdefault("RELAY_GRACE_SECONDS", "5")
 
+ORIGIN = "chrome-extension://iodihamcpbpeioajjeobimgagajmlibd"
+
 from ssh_relay.app import app  # noqa: E402
 from ssh_relay.protocol import (  # noqa: E402
     TAG_CONNECT_SUCCESS,
@@ -97,7 +99,7 @@ async def _read_data_until(ws, needle: bytes, timeout=2.0) -> tuple[bytes, int]:
 async def test_reconnect_resumes_session(echo_server, relay_server):
     url = f"ws://127.0.0.1:{relay_server}/v4/connect?host=127.0.0.1&port={echo_server}"
 
-    async with connect(url, subprotocols=["ssh"]) as ws:
+    async with connect(url, subprotocols=["ssh"], origin=ORIGIN) as ws:
         first = decode(bytes(await ws.recv()))
         assert first.tag == TAG_CONNECT_SUCCESS
         sid = first.sid
@@ -109,7 +111,7 @@ async def test_reconnect_resumes_session(echo_server, relay_server):
 
     # First WS closed. Relay should be holding the session open within grace period.
     rc_url = f"ws://127.0.0.1:{relay_server}/v4/reconnect?sid={sid}&ack={recv_pos}"
-    async with connect(rc_url, subprotocols=["ssh"]) as ws2:
+    async with connect(rc_url, subprotocols=["ssh"], origin=ORIGIN) as ws2:
         first = decode(bytes(await ws2.recv()))
         assert first.tag == TAG_RECONNECT_SUCCESS
 
@@ -130,7 +132,7 @@ async def test_reconnect_replays_data_buffered_while_disconnected(relay_server):
 
     try:
         url = f"ws://127.0.0.1:{relay_server}/v4/connect?host=127.0.0.1&port={tcp_port}"
-        async with connect(url, subprotocols=["ssh"]) as ws:
+        async with connect(url, subprotocols=["ssh"], origin=ORIGIN) as ws:
             first = decode(bytes(await ws.recv()))
             assert first.tag == TAG_CONNECT_SUCCESS
             sid = first.sid
@@ -141,7 +143,7 @@ async def test_reconnect_replays_data_buffered_while_disconnected(relay_server):
         await asyncio.sleep(0.2)
 
         rc_url = f"ws://127.0.0.1:{relay_server}/v4/reconnect?sid={sid}&ack=0"
-        async with connect(rc_url, subprotocols=["ssh"]) as ws2:
+        async with connect(rc_url, subprotocols=["ssh"], origin=ORIGIN) as ws2:
             first = decode(bytes(await ws2.recv()))
             assert first.tag == TAG_RECONNECT_SUCCESS
             got, _ = await _read_data_until(ws2, payload)
@@ -160,6 +162,6 @@ async def test_reconnect_with_unknown_sid_is_rejected(relay_server):
     rc_url = f"ws://127.0.0.1:{relay_server}/v4/reconnect?sid={'0' * 32}&ack=0"
     # websockets raises on close codes >= 4000 during handshake? No — 4xxx are app-level closes;
     # the server accepts then closes. The client sees a close.
-    async with connect(rc_url, subprotocols=["ssh"]) as ws:
+    async with connect(rc_url, subprotocols=["ssh"], origin=ORIGIN) as ws:
         with pytest.raises(Exception):
             await asyncio.wait_for(ws.recv(), timeout=2.0)

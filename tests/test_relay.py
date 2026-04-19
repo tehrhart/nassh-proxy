@@ -16,6 +16,8 @@ os.environ.setdefault("RELAY_IDENTITY_PROVIDER", "none")
 os.environ.setdefault("RELAY_AUTH_REQUIRED", "false")
 os.environ.setdefault("RELAY_LOG_SINKS", "stderr")
 
+ORIGIN = "chrome-extension://iodihamcpbpeioajjeobimgagajmlibd"
+
 from ssh_relay.app import app  # noqa: E402
 from ssh_relay.protocol import (  # noqa: E402
     TAG_CONNECT_SUCCESS,
@@ -66,9 +68,27 @@ async def relay_server():
 
 
 @pytest.mark.asyncio
+async def test_rejects_bad_origin(echo_server, relay_server):
+    url = f"ws://127.0.0.1:{relay_server}/v4/connect?host=127.0.0.1&port={echo_server}"
+    with pytest.raises(Exception):
+        async with connect(
+            url, subprotocols=["ssh"], origin="https://evil.example.com"
+        ) as ws:
+            await asyncio.wait_for(ws.recv(), timeout=1.5)
+
+
+@pytest.mark.asyncio
+async def test_rejects_missing_origin(echo_server, relay_server):
+    url = f"ws://127.0.0.1:{relay_server}/v4/connect?host=127.0.0.1&port={echo_server}"
+    with pytest.raises(Exception):
+        async with connect(url, subprotocols=["ssh"]) as ws:
+            await asyncio.wait_for(ws.recv(), timeout=1.5)
+
+
+@pytest.mark.asyncio
 async def test_echo_roundtrip(echo_server, relay_server):
     url = f"ws://127.0.0.1:{relay_server}/v4/connect?host=127.0.0.1&port={echo_server}"
-    async with connect(url, subprotocols=["ssh"]) as ws:
+    async with connect(url, subprotocols=["ssh"], origin=ORIGIN) as ws:
         first = await ws.recv()
         assert isinstance(first, (bytes, bytearray))
         frame = decode(first)

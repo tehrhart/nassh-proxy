@@ -42,6 +42,15 @@ class Settings(BaseSettings):
     max_replay_buffer: int = 4 * 1024 * 1024
     grace_seconds: int = 120
 
+    # WebSocket Origin allowlist for /v4/connect and /v4/reconnect.
+    # nassh opens the WebSocket from its own chrome-extension:// page, so the
+    # default permits the stable and dev extension IDs. Operators running a
+    # forked extension add their own IDs here.
+    allowed_origins: str = (
+        "chrome-extension://iodihamcpbpeioajjeobimgagajmlibd,"
+        "chrome-extension://algkcnfjnajfhgimadimbjhmpaeohhln"
+    )
+
     # Source-port binding (PAN User-ID mapping). Disabled when min/max unset.
     source_port_min: int | None = None
     source_port_max: int | None = None
@@ -141,6 +150,9 @@ async def v4_connect(
     port: int,
     dstUsername: str | None = None,  # noqa: N803 — nassh protocol field name
 ):
+    if not _check_origin(ws):
+        await ws.close(code=4403)
+        return
     identity = _identity_for_ws(ws)
     if identity is False:
         await ws.close(code=4401)
@@ -197,6 +209,9 @@ async def v4_connect(
 
 @app.websocket("/v4/reconnect")
 async def v4_reconnect(ws: WebSocket, sid: str, ack: int):
+    if not _check_origin(ws):
+        await ws.close(code=4403)
+        return
     identity = _identity_for_ws(ws)
     if identity is False:
         await ws.close(code=4401)
@@ -407,6 +422,15 @@ def _identity_for_ws(ws: WebSocket) -> Identity | None | bool:
         return False
     except Exception:
         return False
+
+
+def _check_origin(ws: WebSocket) -> bool:
+    settings: Settings = ws.app.state.settings
+    origin = ws.headers.get("origin")
+    if not origin:
+        return False
+    allowed = {o.strip() for o in settings.allowed_origins.split(",") if o.strip()}
+    return origin in allowed
 
 
 def _is_safe_ext_id(ext: str) -> bool:
