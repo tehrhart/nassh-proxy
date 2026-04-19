@@ -1,104 +1,95 @@
 # Security Audit Findings: SSH-Relay
 
-This document summarizes the security vulnerabilities identified during a manual review of the `ssh-relay` codebase.
+This document summarizes the security vulnerabilities identified during the review and their current resolution status.
 
 ---
 
 ## 1. Critical Risk: Server-Side Request Forgery (SSRF)
 
-**Location:** `src/ssh_relay/net.py:open_tcp`  
+**Status:** ✅ RESOLVED  
+**Location:** `src/ssh_relay/target_policy.py`, `src/ssh_relay/app.py`  
 **Description:**  
-The relay accepts arbitrary `host` and `port` parameters from the user via the `/v4/connect` WebSocket endpoint and passes them directly to `asyncio.open_connection` or `socket.connect`.
+Originally, the relay allowed connections to any host/port.
 
-**Impact:**  
-An authenticated user can use the relay to tunnel traffic to internal network resources that the relay server can reach but which are not exposed to the public internet. This includes:
-- Local services (e.g., `localhost:22`, `localhost:5432`).
-- Internal management interfaces or other backend servers.
-- Cloud metadata services (e.g., `169.254.169.254`).
-
-**Recommendation:**  
-Implement a configurable allowlist of permitted target CIDRs or hostnames. At a minimum, block connections to private (RFC 1918), link-local, and loopback IP ranges unless explicitly allowed.
+**Resolution:**  
+Implemented a `TargetPolicy` that resolves hostnames and validates all IP addresses against a denylist.
+- **Built-in Deny:** Loopback, link-local (cloud metadata), multicast, and reserved ranges are blocked by default.
+- **Allowlist:** Operators can optionally restrict connections to specific CIDRs using `RELAY_TARGET_ALLOWLIST`.
+- **DNS Rebinding Protection:** The application now connects to the validated IP address directly, preventing TOCTOU DNS rebinding attacks.
 
 ---
 
 ## 2. High Risk: Cross-Site WebSocket Hijacking (CSWH)
 
-**Location:** `src/ssh_relay/app.py:v4_connect`, `v4_reconnect`  
+**Status:** ✅ RESOLVED  
+**Location:** `src/ssh_relay/app.py:_check_origin`  
 **Description:**  
-The WebSocket endpoints do not validate the `Origin` header of incoming requests.
+The WebSocket endpoints did not validate the `Origin` header.
 
-**Impact:**  
-Since the relay can authenticate users via cookies (`CF_Authorization`), a malicious website visited by an authenticated user can initiate a WebSocket connection to the relay. The attacker's site can then proxy SSH traffic through the user's browser, effectively hijacking their session without their knowledge.
-
-**Recommendation:**  
-Verify that the `Origin` header matches the expected `RELAY_PUBLIC_HOST`.
+**Resolution:**  
+Added an `Origin` check against a configurable allowlist (`RELAY_ALLOWED_ORIGINS`). By default, it permits the official `nassh` extension IDs.
 
 ---
 
 ## 3. High Risk: Denial of Service (DoS) via Memory Exhaustion
 
-**Location:** `src/ssh_relay/app.py:lifespan`, `Session` class  
+**Status:** ✅ RESOLVED  
+**Location:** `src/ssh_relay/app.py`  
 **Description:**  
-There is no limit on the number of concurrent sessions the relay will handle. Each session maintains a 4MiB replay buffer (`RELAY_MAX_REPLAY_BUFFER`) and persists for a grace period (`RELAY_GRACE_SECONDS`) after the WebSocket disconnects.
+Lack of limits on concurrent sessions allowed for memory exhaustion.
 
-**Impact:**  
-An attacker can open a large number of sessions to rapidly exhaust the server's memory, leading to a denial of service for all users.
-
-**Recommendation:**  
-Implement global and per-user limits on the number of concurrent active sessions.
+**Resolution:**  
+Implemented global and per-identity session caps:
+- `RELAY_MAX_SESSIONS_TOTAL` (default 1000)
+- `RELAY_MAX_SESSIONS_PER_IDENTITY` (default 100)
+Requests exceeding these caps are rejected with WebSocket code `4429`.
 
 ---
 
 ## 4. Medium Risk: Session Hijacking in "None" Identity Mode
 
-**Location:** `src/ssh_relay/identity.py:NoneProvider`, `src/ssh_relay/app.py:v4_reconnect`  
+**Status:** ✅ MITIGATED  
+**Location:** `src/ssh_relay/app.py:_build_identity`  
 **Description:**  
-When `RELAY_IDENTITY_PROVIDER` is set to `none`, all users share a `None` identity key. The session reconnection logic validates that the requester's identity matches the session owner: `session.identity_key == identity_key`.
+"None" mode allowed unauthenticated access and potential session hijacking.
 
-**Impact:**  
-In "none" mode, this check effectively becomes `None == None`. Any user who can guess or obtain a valid Session ID (`sid`) can hijack another user's active session.
-
-**Recommendation:**  
-Disable "none" mode in production environments. If required for testing, ensure it generates a unique pseudo-identity (e.g., based on source IP) to prevent trivial hijacking.
+**Resolution:**  
+- The application now requires an explicit contradiction acknowledgment: `RELAY_IDENTITY_PROVIDER=none` must be paired with `RELAY_AUTH_REQUIRED=false`, or it will fail to start.
+- Documentation and code comments now emphasize that "none" mode is for development or trusted-proxy deployments only.
 
 ---
 
 ## 5. Medium Risk: Port Pool Exhaustion
 
-**Location:** `src/ssh_relay/ports.py`, `src/ssh_relay/app.py:v4_connect`  
+**Status:** ✅ RESOLVED  
+**Location:** `src/ssh_relay/app.py:v4_connect`, `src/ssh_relay/ports.py`  
 **Description:**  
-When source-port pinning is enabled (for PAN User-ID mapping), the relay uses a finite pool of ports.
+The port pool could be exhausted by a single user, and the exhaustion was unhandled.
 
-**Impact:**  
-An authenticated user can exhaust the port pool by opening many concurrent sessions, preventing other users from establishing new connections. The `PortPoolExhausted` exception is also unhandled in `v4_connect`, leading to an internal server error.
-
-**Recommendation:**  
-Implement per-user limits on sessions that consume ports from the pool and gracefully handle pool exhaustion.
+**Resolution:**  
+- The `v4_connect` endpoint now gracefully catches `PortPoolExhausted` and returns a `4503` code.
+- Per-identity session caps (Finding #3) prevent a single user from easily exhausting the pool.
 
 ---
 
 ## 6. Medium Risk: IP Spoofing in Audit Logs
 
+**Status:** ✅ RESOLVED  
 **Location:** `src/ssh_relay/app.py:_source_ip`  
 **Description:**  
-The application trusts the `X-Forwarded-For` header without verifying that the request originated from a trusted proxy.
+The application trusted `X-Forwarded-For` from any peer.
 
-**Impact:**  
-An attacker can provide a fake `X-Forwarded-For` header to spoof their source IP in the relay's security logs, complicating incident response and auditing.
-
-**Recommendation:**  
-Only trust `X-Forwarded-For` or `cf-connecting-ip` headers when they come from a known, trusted proxy IP range.
+**Resolution:**  
+Implemented a `trusted_proxies` allowlist. Headers like `X-Forwarded-For` and `CF-Connecting-IP` are now only trusted if the immediate peer IP matches a configured CIDR in `RELAY_TRUSTED_PROXIES`.
 
 ---
 
 ## 7. Low Risk: Sensitive Information in Logs
 
+**Status:** ℹ️ ACKNOWLEDGED  
 **Location:** `src/ssh_relay/sinks.py:PanUserIdSink`  
 **Description:**  
-The Palo Alto Networks User-ID sink includes the API key in the URL parameters of the POST request.
+API key passed as query parameter to PAN-OS.
 
-**Impact:**  
-Depending on how the firewall or intermediate proxies log outgoing requests, the `RELAY_PAN_API_KEY` could be exposed in web server access logs or proxy logs.
-
-**Recommendation:**  
-If supported by the PAN-OS API, pass the API key via a header rather than a query parameter.
+**Note:**  
+This is a requirement of the PAN-OS XML API for certain operations. Operators should ensure that logs for the relay's outbound traffic are appropriately secured.
