@@ -564,5 +564,14 @@ def _is_safe_ext_id(ext: str) -> bool:
     return len(ext) == 32 and all("a" <= c <= "p" for c in ext)
 
 
+# Known-good redirect targets the nassh extension uses for the /cookie flow.
+# Restricting to this allowlist prevents abuse of the redirect for phishing
+# or tricking the extension into loading an unexpected internal page.
+ALLOWED_COOKIE_PATHS = frozenset({
+    "html/nassh.html",
+    "html/nassh_google_relay.html",
+})
+
+
 def _is_safe_path(path: str) -> bool:
-    return ".." not in path and "\x00" not in path and "\r" not in path and "\n" not in path
+    return path in ALLOWED_COOKIE_PATHS

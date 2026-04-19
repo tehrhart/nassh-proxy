@@ -156,6 +156,13 @@ If you want PAN to age entries out on its own (in case logout is lost), set
 `RELAY_PAN_LOGIN_TIMEOUT_SECONDS` to a value slightly larger than your
 `RELAY_GRACE_SECONDS`. Default `0` disables the timeout attribute.
 
+**API-key handling.** The PAN-OS XML API only accepts the API key as a query
+parameter (`?key=...`). `RELAY_PAN_API_KEY` is not hardcoded or logged by the
+relay, but the URL it embeds *can* leak through network intermediaries that
+log full request URIs. Do not place an HTTP proxy with URL-access logging
+between the relay and the firewall. Prefer direct TLS to the firewall's
+management interface on a trusted segment.
+
 ## File rotation
 
 `logging.handlers.RotatingFileHandler` is stdlib and rotates in-process.
