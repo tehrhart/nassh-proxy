@@ -19,6 +19,7 @@ from .net import open_tcp
 from .ports import NoPool, PortPool
 from .session import Session, SessionGone, SessionLimits
 from .sinks import PanUserIdSink, RotatingFileSink, SplunkHECSink, StderrSink
+from .target_policy import TargetDenied, TargetPolicy
 
 log = logging.getLogger("ssh_relay")
 
@@ -56,6 +57,14 @@ class Settings(BaseSettings):
     source_port_max: int | None = None
     relay_ip: str | None = None  # Public IP used in PAN mappings.
 
+    # Target allow/deny policy. Loopback, link-local (cloud metadata!),
+    # multicast, and reserved ranges are always blocked. RFC1918 is allowed by
+    # default since reaching internal hosts is typically the purpose of a
+    # corp SSH relay. Tighten with an explicit CIDR allowlist if needed.
+    target_allowlist: str = ""      # comma-separated CIDRs
+    target_denylist_extra: str = "" # comma-separated CIDRs
+    unsafe_allow_loopback: bool = False  # TEST ONLY — never enable in prod
+
     # Log sinks: comma-separated subset of {stderr, file, splunk, pan}.
     log_sinks: str = "stderr"
     log_file_path: str | None = None
@@ -83,6 +92,7 @@ async def lifespan(app: FastAPI):
     app.state.settings = settings
     app.state.provider = _build_identity(settings)
     app.state.port_pool = _build_port_pool(settings)
+    app.state.target_policy = _build_target_policy(settings)
     app.state.bus = EventBus(_build_sinks(settings))
     await app.state.bus.start()
     app.state.sessions = {}
@@ -161,11 +171,34 @@ async def v4_connect(
     port_pool: PortPool | NoPool = ws.app.state.port_pool
     bus: EventBus = ws.app.state.bus
     settings: Settings = ws.app.state.settings
+    policy: TargetPolicy = ws.app.state.target_policy
+
+    try:
+        target = await policy.resolve_and_check(host, port)
+    except TargetDenied as e:
+        bus.emit({
+            "event": "target_denied",
+            "event_id": new_event_id(),
+            "ts": now()[0],
+            "identity": _identity_dict(identity),
+            "source_ip": _source_ip(ws),
+            "target_host": host,
+            "target_port": port,
+            "reason": str(e),
+        })
+        log.warning("target denied %s:%s: %s", host, port, e)
+        await ws.accept(subprotocol="ssh")
+        await ws.close(code=4403)
+        return
 
     source_port = await port_pool.acquire()
     dial_started = time.monotonic()
     try:
-        reader, writer, actual_source_port = await open_tcp(host, port, source_port=source_port)
+        # Connect to the resolved IP, not the hostname, to avoid a second DNS
+        # lookup that could rebind to a different (denied) address.
+        reader, writer, actual_source_port = await open_tcp(
+            target.ip, target.port, source_port=source_port
+        )
     except OSError as e:
         log.warning("dial failed %s:%s %s", host, port, e)
         await port_pool.release(source_port)
@@ -306,6 +339,14 @@ def _build_port_pool(s: Settings) -> PortPool | NoPool:
     if s.source_port_min is None or s.source_port_max is None:
         return NoPool()
     return PortPool(s.source_port_min, s.source_port_max)
+
+
+def _build_target_policy(s: Settings) -> TargetPolicy:
+    return TargetPolicy(
+        allowlist_cidrs=[c.strip() for c in s.target_allowlist.split(",") if c.strip()],
+        extra_deny_cidrs=[c.strip() for c in s.target_denylist_extra.split(",") if c.strip()],
+        unsafe_allow_loopback=s.unsafe_allow_loopback,
+    )
 
 
 def _build_sinks(s: Settings) -> list[Sink]:

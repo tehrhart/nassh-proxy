@@ -16,6 +16,7 @@ os.environ.setdefault("RELAY_IDENTITY_PROVIDER", "none")
 os.environ.setdefault("RELAY_AUTH_REQUIRED", "false")
 os.environ.setdefault("RELAY_LOG_SINKS", "stderr")
 os.environ.setdefault("RELAY_GRACE_SECONDS", "5")
+os.environ.setdefault("RELAY_UNSAFE_ALLOW_LOOPBACK", "true")
 
 ORIGIN = "chrome-extension://iodihamcpbpeioajjeobimgagajmlibd"
 
