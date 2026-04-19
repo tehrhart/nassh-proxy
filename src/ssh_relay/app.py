@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import HTMLResponse
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from .events import EventBus, Sink
+from .events import EventBus, Sink, new_event_id, now
 from .identity import Identity, IdentityProvider, build_provider
 from .net import open_tcp
 from .ports import NoPool, PortPool
@@ -102,12 +102,26 @@ async def cookie(
     version: str = Query("2"),
     method: str = Query("js-redirect"),
 ):
-    _require_identity(request)
+    identity = _require_identity(request)
     settings: Settings = request.app.state.settings
     if version != "2" or method != "js-redirect":
         raise HTTPException(400, "unsupported /cookie version/method")
     if not _is_safe_ext_id(ext) or not _is_safe_path(path):
         raise HTTPException(400, "invalid ext or path")
+
+    bus: EventBus = request.app.state.bus
+    ts_iso, ts = now()
+    bus.emit({
+        "event": "handshake",
+        "event_id": new_event_id(),
+        "ts": ts_iso,
+        "ts_epoch": ts,
+        "identity": _identity_dict(identity),
+        "source_ip": _request_source_ip(request),
+        "user_agent": request.headers.get("user-agent"),
+        "extension_id": ext,
+        "redirect_path": path,
+    })
 
     payload = {"endpoint": f"{settings.public_host}:{settings.public_port}"}
     fragment = base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b"=").decode()
@@ -121,7 +135,12 @@ async def cookie(
 
 
 @app.websocket("/v4/connect")
-async def v4_connect(ws: WebSocket, host: str, port: int):
+async def v4_connect(
+    ws: WebSocket,
+    host: str,
+    port: int,
+    dstUsername: str | None = None,  # noqa: N803 — nassh protocol field name
+):
     identity = _identity_for_ws(ws)
     if identity is False:
         await ws.close(code=4401)
@@ -151,6 +170,7 @@ async def v4_connect(ws: WebSocket, host: str, port: int):
         identity=identity,
         target_host=host,
         target_port=port,
+        target_username=dstUsername,
         source_port=actual_source_port,
         dial_seconds=round(time.monotonic() - dial_started, 4),
     )
@@ -297,23 +317,18 @@ def _build_meta(
     identity: Identity | None,
     target_host: str,
     target_port: int,
+    target_username: str | None,
     source_port: int | None,
     dial_seconds: float,
 ) -> dict[str, Any]:
-    ident_dict: dict[str, Any] | None = None
-    if isinstance(identity, Identity):
-        ident_dict = {
-            "provider": identity.provider,
-            "sub": identity.sub,
-            "email": identity.email,
-        }
     return {
-        "identity": ident_dict,
+        "identity": _identity_dict(identity),
         "source_ip": _source_ip(ws),
         "source_port": source_port,
         "user_agent": ws.headers.get("user-agent"),
         "target_host": target_host,
         "target_port": target_port,
+        "target_username": target_username,
         "dial_seconds": dial_seconds,
     }
 
@@ -338,14 +353,31 @@ def _limits(settings: Settings) -> SessionLimits:
     )
 
 
-def _require_identity(request: Request):
+def _require_identity(request: Request) -> Identity | None:
     provider: IdentityProvider = request.app.state.provider
     try:
-        provider.identify(request.headers)
+        return provider.identify(request.headers)
     except PermissionError as e:
         raise HTTPException(401, str(e))
     except Exception as e:
         raise HTTPException(401, f"invalid identity assertion: {e}")
+
+
+def _identity_dict(identity: Identity | None) -> dict[str, Any] | None:
+    if isinstance(identity, Identity):
+        return {"provider": identity.provider, "sub": identity.sub, "email": identity.email}
+    return None
+
+
+def _request_source_ip(request: Request) -> str | None:
+    ip = request.headers.get("cf-connecting-ip")
+    if ip:
+        return ip
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    client = request.client
+    return client.host if client else None
 
 
 def _identity_for_ws(ws: WebSocket) -> Identity | None | bool:
