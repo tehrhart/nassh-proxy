@@ -21,6 +21,8 @@ from .session import Session, SessionGone, SessionLimits
 from .sinks import PanUserIdSink, RotatingFileSink, SplunkHECSink, StderrSink
 from .target_policy import TargetDenied, TargetPolicy
 
+from ipaddress import ip_address, ip_network  # noqa: E402
+
 log = logging.getLogger("ssh_relay")
 
 
@@ -53,6 +55,11 @@ class Settings(BaseSettings):
         "chrome-extension://iodihamcpbpeioajjeobimgagajmlibd,"
         "chrome-extension://algkcnfjnajfhgimadimbjhmpaeohhln"
     )
+
+    # Comma-separated CIDRs whose peers are allowed to set CF-Connecting-IP /
+    # X-Forwarded-For. Default empty = never trust those headers. For a CF
+    # Tunnel deployment with cloudflared on the same host, set "127.0.0.1/32".
+    trusted_proxies: str = ""
 
     # Source-port binding (PAN User-ID mapping). Disabled when min/max unset.
     source_port_min: int | None = None
@@ -467,14 +474,34 @@ def _build_meta(
 
 
 def _source_ip(ws: WebSocket) -> str | None:
-    ip = ws.headers.get("cf-connecting-ip")
-    if ip:
-        return ip
-    xff = ws.headers.get("x-forwarded-for")
-    if xff:
-        return xff.split(",")[0].strip()
-    client = ws.client
-    return client.host if client else None
+    peer = ws.client.host if ws.client else None
+    if _peer_is_trusted_proxy(ws.app.state.settings, peer):
+        ip = ws.headers.get("cf-connecting-ip")
+        if ip:
+            return ip
+        xff = ws.headers.get("x-forwarded-for")
+        if xff:
+            return xff.split(",")[0].strip()
+    return peer
+
+
+def _peer_is_trusted_proxy(settings: Settings, peer: str | None) -> bool:
+    if not peer or not settings.trusted_proxies:
+        return False
+    try:
+        peer_ip = ip_address(peer)
+    except ValueError:
+        return False
+    for cidr in settings.trusted_proxies.split(","):
+        cidr = cidr.strip()
+        if not cidr:
+            continue
+        try:
+            if peer_ip in ip_network(cidr, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def _limits(settings: Settings) -> SessionLimits:
@@ -503,14 +530,15 @@ def _identity_dict(identity: Identity | None) -> dict[str, Any] | None:
 
 
 def _request_source_ip(request: Request) -> str | None:
-    ip = request.headers.get("cf-connecting-ip")
-    if ip:
-        return ip
-    xff = request.headers.get("x-forwarded-for")
-    if xff:
-        return xff.split(",")[0].strip()
-    client = request.client
-    return client.host if client else None
+    peer = request.client.host if request.client else None
+    if _peer_is_trusted_proxy(request.app.state.settings, peer):
+        ip = request.headers.get("cf-connecting-ip")
+        if ip:
+            return ip
+        xff = request.headers.get("x-forwarded-for")
+        if xff:
+            return xff.split(",")[0].strip()
+    return peer
 
 
 def _identity_for_ws(ws: WebSocket) -> Identity | None | bool:
