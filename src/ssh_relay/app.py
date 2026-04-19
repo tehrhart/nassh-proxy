@@ -241,6 +241,25 @@ async def _run_session(ws: WebSocket, session: Session, sessions: dict, resume_f
 
 def _build_identity(s: Settings) -> IdentityProvider:
     kind = s.identity_provider.lower()
+
+    # Fail loudly when provider-specific credentials are set but the provider
+    # isn't selected. A silent fall-through to the 'none' provider means every
+    # request is unauthenticated — the opposite of what the operator intended.
+    if kind != "cloudflare-access" and (s.cf_team_domain or s.cf_audience):
+        raise RuntimeError(
+            "RELAY_CF_TEAM_DOMAIN / RELAY_CF_AUDIENCE are set but "
+            f"RELAY_IDENTITY_PROVIDER={s.identity_provider!r}. "
+            "Set RELAY_IDENTITY_PROVIDER=cloudflare-access to activate, "
+            "or unset the CF_* variables."
+        )
+    if kind != "gcp-iap" and s.iap_audience:
+        raise RuntimeError(
+            "RELAY_IAP_AUDIENCE is set but "
+            f"RELAY_IDENTITY_PROVIDER={s.identity_provider!r}. "
+            "Set RELAY_IDENTITY_PROVIDER=gcp-iap to activate, "
+            "or unset RELAY_IAP_AUDIENCE."
+        )
+
     if kind == "cloudflare-access":
         if not s.cf_team_domain or not s.cf_audience:
             raise RuntimeError("RELAY_CF_TEAM_DOMAIN and RELAY_CF_AUDIENCE required")
