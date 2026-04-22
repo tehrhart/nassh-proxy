@@ -9,9 +9,13 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any
 
+from pathlib import Path
+
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from .events import EventBus, Sink, new_event_id, now
 from .identity import Identity, IdentityProvider, build_provider
@@ -50,11 +54,16 @@ class Settings(BaseSettings):
     # WebSocket Origin allowlist for /v4/connect and /v4/reconnect.
     # nassh opens the WebSocket from its own chrome-extension:// page, so the
     # default permits the stable and dev extension IDs. Operators running a
-    # forked extension add their own IDs here.
+    # forked extension add their own IDs here.  When serving the web client,
+    # add the web origin (e.g. "https://ssh.example.com") as well.
     allowed_origins: str = (
         "chrome-extension://iodihamcpbpeioajjeobimgagajmlibd,"
         "chrome-extension://algkcnfjnajfhgimadimbjhmpaeohhln"
     )
+
+    # Directory containing the static SSH web client files.
+    # Set to empty string to disable static file serving.
+    static_dir: str = "static"
 
     # Comma-separated CIDRs whose peers are allowed to set CF-Connecting-IP /
     # X-Forwarded-For. Default empty = never trust those headers. For a CF
@@ -98,6 +107,14 @@ class Settings(BaseSettings):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = Settings()
+
+    if not settings.auth_required:
+        log.warning(
+            "*** RELAY_AUTH_REQUIRED=false — relay is UNAUTHENTICATED. "
+            "Any client can proxy SSH connections through this server. "
+            "Do NOT use this setting in production. ***"
+        )
+
     app.state.settings = settings
     app.state.provider = _build_identity(settings)
     app.state.port_pool = _build_port_pool(settings)
@@ -117,25 +134,77 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Add security headers to responses.
+
+    COOP/COEP are required for SharedArrayBuffer (WASM workers) and are
+    scoped to non-API paths.  CSP is applied globally to defend stored
+    SSH keys in IndexedDB against XSS exfiltration.
+    """
+    STATIC_PREFIXES = ("/", "/js/", "/css/", "/nassh/", "/hterm/",
+                       "/libdot/", "/wassh/", "/wasi-js-bindings/",
+                       "/plugin/", "/_locales/")
+    API_PATHS = ("/healthz", "/cookie", "/endpoint", "/v4/")
+
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        path = request.url.path
+
+        is_api = any(path.startswith(p) for p in self.API_PATHS)
+
+        if not is_api:
+            response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+            response.headers["Cross-Origin-Embedder-Policy"] = "require-corp"
+
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self' 'wasm-unsafe-eval' https://static.cloudflareinsights.com; "
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+            "font-src 'self' https://fonts.gstatic.com; "
+            "connect-src 'self'; "
+            "media-src 'self' data:; "
+            "img-src 'self' data:; "
+            "frame-src 'none'; "
+            "object-src 'none'; "
+            "base-uri 'self'"
+        )
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response
+
+
+app.add_middleware(SecurityHeadersMiddleware)
+
+
 @app.get("/healthz")
 async def healthz():
     return {"ok": True}
 
 
+@app.get("/endpoint")
+async def endpoint(request: Request, host: str | None = None):
+    """Return the relay endpoint for direct-method auth.
+
+    The nassh client calls this to discover which relay to connect to.
+    Since the web client is same-origin, we just return ourselves.
+    """
+    _require_identity(request)
+    settings: Settings = request.app.state.settings
+    payload = {"endpoint": f"{settings.public_host}:{settings.public_port}"}
+    body = ")]}'\n" + json.dumps(payload)
+    return HTMLResponse(content=body, media_type="text/plain")
+
+
 @app.get("/cookie")
 async def cookie(
     request: Request,
-    ext: str = Query(...),
-    path: str = Query(...),
+    ext: str | None = Query(None),
+    path: str | None = Query(None),
     version: str = Query("2"),
     method: str = Query("js-redirect"),
 ):
     identity = _require_identity(request)
     settings: Settings = request.app.state.settings
-    if version != "2" or method != "js-redirect":
-        raise HTTPException(400, "unsupported /cookie version/method")
-    if not _is_safe_ext_id(ext) or not _is_safe_path(path):
-        raise HTTPException(400, "invalid ext or path")
 
     bus: EventBus = request.app.state.bus
     ts_iso, ts = now()
@@ -150,6 +219,20 @@ async def cookie(
         "extension_id": ext,
         "redirect_path": path,
     })
+
+    # Direct method: return endpoint as JSON (used by web client).
+    if method == "direct":
+        payload = {"endpoint": f"{settings.public_host}:{settings.public_port}"}
+        body = ")]}'\n" + json.dumps(payload)
+        return HTMLResponse(content=body, media_type="text/plain")
+
+    # JS-redirect method: redirect back to Chrome extension (original flow).
+    if version != "2" or method != "js-redirect":
+        raise HTTPException(400, "unsupported /cookie version/method")
+    if not ext or not path:
+        raise HTTPException(400, "ext and path required for js-redirect method")
+    if not _is_safe_ext_id(ext) or not _is_safe_path(path):
+        raise HTTPException(400, "invalid ext or path")
 
     payload = {"endpoint": f"{settings.public_host}:{settings.public_port}"}
     fragment = base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b"=").decode()
@@ -557,6 +640,12 @@ def _check_origin(ws: WebSocket) -> bool:
     if not origin:
         return False
     allowed = {o.strip() for o in settings.allowed_origins.split(",") if o.strip()}
+    # Also allow the relay's own origin (for the same-origin web client).
+    proto = "https" if settings.public_port == 443 else "http"
+    self_origin = f"{proto}://{settings.public_host}"
+    if settings.public_port not in (80, 443):
+        self_origin += f":{settings.public_port}"
+    allowed.add(self_origin)
     return origin in allowed
 
 
@@ -575,3 +664,24 @@ ALLOWED_COOKIE_PATHS = frozenset({
 
 def _is_safe_path(path: str) -> bool:
     return path in ALLOWED_COOKIE_PATHS
+
+
+# --- Static file serving for the SSH web client ---
+# Mounted last so API routes (/healthz, /cookie, /v4/*) take priority.
+def _mount_static(application: FastAPI) -> None:
+    """Mount the static web client directory if it exists."""
+    # Defer reading settings — this runs at import time before lifespan.
+    # We read the env var directly for the static dir path.
+    import os
+    static_dir = os.environ.get("RELAY_STATIC_DIR", "static")
+    if not static_dir:
+        return
+    static_path = Path(static_dir)
+    if not static_path.is_dir():
+        log.info("Static dir %s not found; web client disabled", static_path)
+        return
+    log.info("Serving web client from %s", static_path.resolve())
+    application.mount("/", StaticFiles(directory=static_path, html=True), name="static")
+
+
+_mount_static(app)
